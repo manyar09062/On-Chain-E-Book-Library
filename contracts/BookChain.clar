@@ -9,6 +9,9 @@
 (define-constant ERR_INVALID_PRICE (err u105))
 (define-constant ERR_RENTAL_EXPIRED (err u106))
 (define-constant ERR_BOOK_NOT_AVAILABLE (err u107))
+(define-constant ERR_GIFT_NOT_FOUND (err u108))
+(define-constant ERR_GIFT_ALREADY_CLAIMED (err u109))
+(define-constant ERR_NOT_GIFT_RECIPIENT (err u110))
 
 (define-data-var next-book-id uint u1)
 (define-data-var platform-fee-percentage uint u5)
@@ -45,6 +48,31 @@
 (define-map user-library
   { user: principal }
   { books-owned: (list 1000 uint), books-rented: (list 100 uint) }
+)
+
+(define-data-var next-gift-id uint u1)
+
+(define-map book-gifts
+  { gift-id: uint }
+  {
+    book-id: uint,
+    sender: principal,
+    recipient: principal,
+    message: (string-utf8 200),
+    gifted-at: uint,
+    claimed: bool,
+    claimed-at: (optional uint)
+  }
+)
+
+(define-map user-gifts-sent
+  { user: principal }
+  { gift-ids: (list 100 uint) }
+)
+
+(define-map user-gifts-received
+  { user: principal }
+  { gift-ids: (list 100 uint) }
 )
 
 (define-public (add-book (title (string-ascii 100)) (price uint) (rental-price uint) (total-copies uint))
@@ -186,6 +214,82 @@
   )
 )
 
+(define-public (gift-book (book-id uint) (recipient principal) (message (string-utf8 200)))
+  (let
+    (
+      (book (unwrap! (map-get? books { book-id: book-id }) ERR_BOOK_NOT_FOUND))
+      (sender tx-sender)
+      (author (get author book))
+      (book-price (get price book))
+      (platform-fee (/ (* book-price (var-get platform-fee-percentage)) u100))
+      (author-payment (- book-price platform-fee))
+      (current-block burn-block-height)
+      (gift-id (var-get next-gift-id))
+    )
+    (asserts! (get is-active book) ERR_BOOK_NOT_AVAILABLE)
+    (asserts! (> (get available-copies book) u0) ERR_BOOK_NOT_AVAILABLE)
+    (asserts! (not (is-eq sender recipient)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-none (map-get? book-owners { book-id: book-id, owner: recipient })) ERR_ALREADY_OWNS_BOOK)
+    
+    (try! (stx-transfer? book-price sender CONTRACT_OWNER))
+    (try! (stx-transfer? author-payment CONTRACT_OWNER author))
+    
+    (map-set books
+      { book-id: book-id }
+      (merge book { available-copies: (- (get available-copies book) u1) })
+    )
+    
+    (map-set book-gifts
+      { gift-id: gift-id }
+      {
+        book-id: book-id,
+        sender: sender,
+        recipient: recipient,
+        message: message,
+        gifted-at: current-block,
+        claimed: false,
+        claimed-at: none
+      }
+    )
+    
+    (unwrap-panic (update-author-earnings author author-payment))
+    (unwrap-panic (track-gift-sent sender gift-id))
+    (unwrap-panic (track-gift-received recipient gift-id))
+    
+    (var-set next-gift-id (+ gift-id u1))
+    (ok gift-id)
+  )
+)
+
+(define-public (claim-gift (gift-id uint))
+  (let
+    (
+      (gift (unwrap! (map-get? book-gifts { gift-id: gift-id }) ERR_GIFT_NOT_FOUND))
+      (claimer tx-sender)
+      (book-id (get book-id gift))
+      (recipient (get recipient gift))
+      (current-block burn-block-height)
+    )
+    (asserts! (is-eq claimer recipient) ERR_NOT_GIFT_RECIPIENT)
+    (asserts! (not (get claimed gift)) ERR_GIFT_ALREADY_CLAIMED)
+    (asserts! (is-none (map-get? book-owners { book-id: book-id, owner: claimer })) ERR_ALREADY_OWNS_BOOK)
+    
+    (map-set book-owners
+      { book-id: book-id, owner: claimer }
+      { purchased-at: current-block, access-type: "gift" }
+    )
+    
+    (map-set book-gifts
+      { gift-id: gift-id }
+      (merge gift { claimed: true, claimed-at: (some current-block) })
+    )
+    
+    (unwrap-panic (add-to-user-library claimer book-id "owned"))
+    
+    (ok true)
+  )
+)
+
 (define-public (withdraw-earnings)
   (let
     (
@@ -213,6 +317,32 @@
     (map-set author-earnings
       { author: author }
       { total-earned: (+ (get total-earned current-earnings) amount) }
+    )
+    (ok true)
+  )
+)
+
+(define-private (track-gift-sent (sender principal) (gift-id uint))
+  (let
+    (
+      (current-gifts (default-to { gift-ids: (list) } (map-get? user-gifts-sent { user: sender })))
+    )
+    (map-set user-gifts-sent
+      { user: sender }
+      { gift-ids: (unwrap! (as-max-len? (append (get gift-ids current-gifts) gift-id) u100) (err u999)) }
+    )
+    (ok true)
+  )
+)
+
+(define-private (track-gift-received (recipient principal) (gift-id uint))
+  (let
+    (
+      (current-gifts (default-to { gift-ids: (list) } (map-get? user-gifts-received { user: recipient })))
+    )
+    (map-set user-gifts-received
+      { user: recipient }
+      { gift-ids: (unwrap! (as-max-len? (append (get gift-ids current-gifts) gift-id) u100) (err u999)) }
     )
     (ok true)
   )
@@ -314,6 +444,38 @@
     )
     none
   )
+)
+
+(define-read-only (get-gift (gift-id uint))
+  (map-get? book-gifts { gift-id: gift-id })
+)
+
+(define-read-only (get-gifts-sent (user principal))
+  (map-get? user-gifts-sent { user: user })
+)
+
+(define-read-only (get-gifts-received (user principal))
+  (map-get? user-gifts-received { user: user })
+)
+
+(define-read-only (get-unclaimed-gifts (user principal))
+  (let
+    (
+      (received-gifts (default-to { gift-ids: (list) } (map-get? user-gifts-received { user: user })))
+    )
+    (filter is-gift-unclaimed (get gift-ids received-gifts))
+  )
+)
+
+(define-private (is-gift-unclaimed (gift-id uint))
+  (match (map-get? book-gifts { gift-id: gift-id })
+    gift (not (get claimed gift))
+    false
+  )
+)
+
+(define-read-only (get-gift-count)
+  (- (var-get next-gift-id) u1)
 )
 
 (define-read-only (get-contract-owner)
